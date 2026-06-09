@@ -24,16 +24,38 @@ const BMA400_SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0';
 const BMA400_COMMAND_UUID = '12345678-1234-5678-1234-56789abcdef1';
 const BMA400_DATA_UUID = '12345678-1234-5678-1234-56789abcdef2';
 
-function base64ToText(value: string | null): string {
+function base64ToBytes(value: string | null): Uint8Array {
   if (!value) {
-    return '';
+    return new Uint8Array();
   }
 
-  return Buffer.from(value, 'base64').toString('utf8');
+  return Uint8Array.from(Buffer.from(value, 'base64'));
+}
+
+function bytesToText(bytes: Uint8Array): string {
+  return Buffer.from(bytes).toString('utf8');
 }
 
 function textToBase64(text: string): string {
   return Buffer.from(text, 'utf8').toString('base64');
+}
+
+function readU16LE(bytes: Uint8Array, offset: number): number {
+  return bytes[offset] | (bytes[offset + 1] << 8);
+}
+
+function readI16LE(bytes: Uint8Array, offset: number): number {
+  const value = readU16LE(bytes, offset);
+  return value >= 0x8000 ? value - 0x10000 : value;
+}
+
+function readU32LE(bytes: Uint8Array, offset: number): number {
+  return (
+    bytes[offset] |
+    (bytes[offset + 1] << 8) |
+    (bytes[offset + 2] << 16) |
+    (bytes[offset + 3] << 24)
+  ) >>> 0;
 }
 
 async function requestBlePermissions(): Promise<boolean> {
@@ -79,6 +101,20 @@ export default function App() {
 
   const csvLinesRef = useRef<string[]>([]);
   const receivingCsvRef = useRef(false);
+
+  const binarySamplesRef = useRef<
+  Array<{
+    sample_id: number;
+    t_ms: number;
+    ax_raw: number;
+    ay_raw: number;
+    az_raw: number;
+  }>
+>([]);
+
+const expectedSamplesRef = useRef(0);
+const samplePeriodMsRef = useRef(0);
+const receivingBinaryRef = useRef(false);
 
   function addLog(message: string) {
     setLog(prev => [`${new Date().toLocaleTimeString()}  ${message}`, ...prev]);
@@ -159,6 +195,24 @@ export default function App() {
     }
   }
 
+  function handleBleNotification(bytes: Uint8Array) {
+    if (bytes.length === 0) {
+      return;
+    }
+  
+    const handledAsBinary = handleBinaryPacket(bytes);
+  
+    if (handledAsBinary) {
+      return;
+    }
+  
+    const text = bytesToText(bytes);
+  
+    if (text.length > 0) {
+      handleReceivedTextChunk(text);
+    }
+  }
+
   async function connectAndSetupNotify(device: Device) {
     setStatus('CONNECTING');
     addLog(`Connecting to ${device.name ?? device.id}`);
@@ -184,10 +238,10 @@ export default function App() {
           return;
         }
 
-        const text = base64ToText(characteristic?.value ?? null);
+        const bytes = base64ToBytes(characteristic?.value ?? null);
 
-        if (text.length > 0) {
-          handleReceivedTextChunk(text);
+        if (bytes.length > 0) {
+          handleBleNotification(bytes);
         }
       },
     );
@@ -264,6 +318,11 @@ export default function App() {
     csvLinesRef.current = [];
     receivingCsvRef.current = false;
     textBufferRef.current = '';
+    
+    binarySamplesRef.current = [];
+    expectedSamplesRef.current = 0;
+    samplePeriodMsRef.current = 0;
+    receivingBinaryRef.current = false;
 
     setCsvReady(false);
     setCsvText('');
@@ -286,6 +345,125 @@ export default function App() {
     setStatus('DISCONNECTED');
     setDeviceName('-');
     addLog('Disconnected');
+  }
+
+  function samplesToCsvText(
+    samples: Array<{
+      sample_id: number;
+      t_ms: number;
+      ax_raw: number;
+      ay_raw: number;
+      az_raw: number;
+    }>,
+  ): string {
+    const lines = ['sample_id,t_ms,ax_raw,ay_raw,az_raw'];
+  
+    for (const s of samples) {
+      lines.push(`${s.sample_id},${s.t_ms},${s.ax_raw},${s.ay_raw},${s.az_raw}`);
+    }
+  
+    return lines.join('\n') + '\n';
+  }
+
+  function handleBinaryPacket(bytes: Uint8Array): boolean {
+    if (bytes.length === 0) {
+      return false;
+    }
+  
+    const type = bytes[0];
+  
+    if (type === 0x10) {
+      if (bytes.length !== 7) {
+        addLog(`Invalid BEGIN packet length: ${bytes.length}`);
+        setStatus('BINARY_BEGIN_ERROR');
+        return true;
+      }
+  
+      const expectedSamples = readU32LE(bytes, 1);
+      const samplePeriodMs = readU16LE(bytes, 5);
+  
+      binarySamplesRef.current = [];
+      expectedSamplesRef.current = expectedSamples;
+      samplePeriodMsRef.current = samplePeriodMs;
+      receivingBinaryRef.current = true;
+  
+      setCsvReady(false);
+      setCsvText('');
+      setSampleCount(0);
+      setStatus('RECEIVING_BINARY');
+  
+      addLog(`BIN BEGIN: samples=${expectedSamples}, period=${samplePeriodMs} ms`);
+      return true;
+    }
+  
+    if (type === 0x01) {
+      if (bytes.length !== 15) {
+        addLog(`Invalid SAMPLE packet length: ${bytes.length}`);
+        setStatus('BINARY_SAMPLE_ERROR');
+        return true;
+      }
+  
+      if (!receivingBinaryRef.current) {
+        addLog('SAMPLE packet received outside BEGIN/END');
+        setStatus('BINARY_SEQUENCE_ERROR');
+        return true;
+      }
+  
+      const sample = {
+        sample_id: readU32LE(bytes, 1),
+        t_ms: readU32LE(bytes, 5),
+        ax_raw: readI16LE(bytes, 9),
+        ay_raw: readI16LE(bytes, 11),
+        az_raw: readI16LE(bytes, 13),
+      };
+  
+      binarySamplesRef.current.push(sample);
+  
+      const samples = binarySamplesRef.current.length;
+      setSampleCount(samples);
+  
+      if (samples <= 3) {
+        addLog(
+          `BIN SAMPLE: ${sample.sample_id},${sample.t_ms},${sample.ax_raw},${sample.ay_raw},${sample.az_raw}`,
+        );
+      } else if (samples % 100 === 0) {
+        addLog(`Receiving binary: ${samples}/${expectedSamplesRef.current}`);
+      }
+  
+      return true;
+    }
+  
+    if (type === 0x11) {
+      if (bytes.length !== 5) {
+        addLog(`Invalid END packet length: ${bytes.length}`);
+        setStatus('BINARY_END_ERROR');
+        return true;
+      }
+  
+      const endCount = readU32LE(bytes, 1);
+      const received = binarySamplesRef.current.length;
+  
+      receivingBinaryRef.current = false;
+  
+      const csv = samplesToCsvText(binarySamplesRef.current);
+  
+      setCsvText(csv);
+      setSampleCount(received);
+      setCsvReady(received === endCount);
+      setStatus(received === endCount ? 'CSV_READY' : 'CSV_INCOMPLETE');
+  
+      addLog(`BIN END: endCount=${endCount}, received=${received}`);
+  
+      if (received !== endCount) {
+        addLog('WARNING: binary sample count mismatch');
+      } else {
+        addLog(`CSV ready: ${received} samples`);
+      }
+  
+      return true;
+    }
+  
+    return false;
   }
 
   return (
