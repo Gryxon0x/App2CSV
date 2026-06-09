@@ -100,21 +100,8 @@ export default function App() {
   const textBufferRef = useRef('');
 
   const csvLinesRef = useRef<string[]>([]);
-  const receivingCsvRef = useRef(false);
-
-  const binarySamplesRef = useRef<
-  Array<{
-    sample_id: number;
-    t_ms: number;
-    ax_raw: number;
-    ay_raw: number;
-    az_raw: number;
-  }>
->([]);
-
-const expectedSamplesRef = useRef(0);
-const samplePeriodMsRef = useRef(0);
-const receivingBinaryRef = useRef(false);
+  const expectedSamplesRef = useRef(0);
+  const receivingBinaryRef = useRef(false);
 
   function addLog(message: string) {
     setLog(prev => [`${new Date().toLocaleTimeString()}  ${message}`, ...prev]);
@@ -122,50 +109,6 @@ const receivingBinaryRef = useRef(false);
 
   function handleLine(line: string) {
     if (!line) {
-      return;
-    }
-
-    if (line === 'BEGIN_CSV') {
-      receivingCsvRef.current = true;
-      csvLinesRef.current = [];
-
-      setCsvReady(false);
-      setCsvText('');
-      setSampleCount(0);
-      setStatus('RECEIVING_CSV');
-
-      addLog('RX: BEGIN_CSV');
-      return;
-    }
-
-    if (line === 'END_CSV') {
-      receivingCsvRef.current = false;
-
-      const text = csvLinesRef.current.join('\n') + '\n';
-      const samples = Math.max(csvLinesRef.current.length - 1, 0);
-
-      setCsvText(text);
-      setSampleCount(samples);
-      setCsvReady(true);
-      setStatus('CSV_READY');
-
-      addLog('RX: END_CSV');
-      addLog(`CSV ready: ${samples} samples`);
-      return;
-    }
-
-    if (receivingCsvRef.current) {
-      csvLinesRef.current.push(line);
-
-      const lines = csvLinesRef.current.length;
-      const samples = Math.max(lines - 1, 0);
-
-      setSampleCount(samples);
-
-      if (samples % 100 === 0 && samples > 0) {
-        addLog(`Receiving CSV: ${samples} samples`);
-      }
-
       return;
     }
 
@@ -315,13 +258,10 @@ const receivingBinaryRef = useRef(false);
   }
 
   async function startMeasurement(durationMs: number) {
-    csvLinesRef.current = [];
-    receivingCsvRef.current = false;
     textBufferRef.current = '';
     
-    binarySamplesRef.current = [];
+    csvLinesRef.current = [];
     expectedSamplesRef.current = 0;
-    samplePeriodMsRef.current = 0;
     receivingBinaryRef.current = false;
 
     setCsvReady(false);
@@ -340,29 +280,9 @@ const receivingBinaryRef = useRef(false);
       deviceRef.current = null;
     }
 
-    receivingCsvRef.current = false;
-
     setStatus('DISCONNECTED');
     setDeviceName('-');
     addLog('Disconnected');
-  }
-
-  function samplesToCsvText(
-    samples: Array<{
-      sample_id: number;
-      t_ms: number;
-      ax_raw: number;
-      ay_raw: number;
-      az_raw: number;
-    }>,
-  ): string {
-    const lines = ['sample_id,t_ms,ax_raw,ay_raw,az_raw'];
-  
-    for (const s of samples) {
-      lines.push(`${s.sample_id},${s.t_ms},${s.ax_raw},${s.ay_raw},${s.az_raw}`);
-    }
-  
-    return lines.join('\n') + '\n';
   }
 
   function handleBinaryPacket(bytes: Uint8Array): boolean {
@@ -382,9 +302,8 @@ const receivingBinaryRef = useRef(false);
       const expectedSamples = readU32LE(bytes, 1);
       const samplePeriodMs = readU16LE(bytes, 5);
   
-      binarySamplesRef.current = [];
+      csvLinesRef.current = ['sample_id,t_ms,ax_raw,ay_raw,az_raw'];
       expectedSamplesRef.current = expectedSamples;
-      samplePeriodMsRef.current = samplePeriodMs;
       receivingBinaryRef.current = true;
   
       setCsvReady(false);
@@ -409,23 +328,24 @@ const receivingBinaryRef = useRef(false);
         return true;
       }
   
-      const sample = {
-        sample_id: readU32LE(bytes, 1),
-        t_ms: readU32LE(bytes, 5),
-        ax_raw: readI16LE(bytes, 9),
-        ay_raw: readI16LE(bytes, 11),
-        az_raw: readI16LE(bytes, 13),
-      };
+
+      const sampleId = readU32LE(bytes, 1);
+      const tMs = readU32LE(bytes, 5);
+      const ax = readI16LE(bytes, 9);
+      const ay = readI16LE(bytes, 11);
+      const az = readI16LE(bytes, 13);
   
-      binarySamplesRef.current.push(sample);
+      csvLinesRef.current.push(`${sampleId},${tMs},${ax},${ay},${az}`);
   
-      const samples = binarySamplesRef.current.length;
-      setSampleCount(samples);
+      const samples = csvLinesRef.current.length - 1;
+
+      if (samples % 20 === 0) {
+        setSampleCount(samples);
+      }
   
+
       if (samples <= 3) {
-        addLog(
-          `BIN SAMPLE: ${sample.sample_id},${sample.t_ms},${sample.ax_raw},${sample.ay_raw},${sample.az_raw}`,
-        );
+        addLog(`BIN SAMPLE: ${sampleId},${tMs},${ax},${ay},${az}`);
       } else if (samples % 100 === 0) {
         addLog(`Receiving binary: ${samples}/${expectedSamplesRef.current}`);
       }
@@ -441,11 +361,11 @@ const receivingBinaryRef = useRef(false);
       }
   
       const endCount = readU32LE(bytes, 1);
-      const received = binarySamplesRef.current.length;
+      const received = Math.max(csvLinesRef.current.length -1, 0);
   
       receivingBinaryRef.current = false;
   
-      const csv = samplesToCsvText(binarySamplesRef.current);
+      const csv = csvLinesRef.current.join('\n') + '\n';
   
       setCsvText(csv);
       setSampleCount(received);
