@@ -20,6 +20,9 @@ import {
 import {BleManager, Device, Characteristic} from 'react-native-ble-plx';
 import {Buffer} from 'buffer';
 
+import RNFS from 'react-native-fs';
+import Share from 'react-native-share';
+
 const BMA400_SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0';
 const BMA400_COMMAND_UUID = '12345678-1234-5678-1234-56789abcdef1';
 const BMA400_DATA_UUID = '12345678-1234-5678-1234-56789abcdef2';
@@ -272,6 +275,44 @@ export default function App() {
     await sendCommand(`START,${durationMs}`);
   }
 
+
+  async function exportCsv() {
+    if (!csvReady || csvText.length === 0) {
+      Alert.alert('Brak gotowego CSV', 'Najpierw wykonaj pomiar.');
+      return;
+    }
+  
+    try {
+      const timestamp = new Date()
+        .toISOString()
+        .replace(/[:.]/g, '-');
+  
+      const fileName = `bma400_${timestamp}.csv`;
+      const filePath = `${RNFS.CachesDirectoryPath}/${fileName}`;
+  
+      await RNFS.writeFile(filePath, csvText, 'utf8');
+  
+      addLog(`CSV saved to cache: ${fileName}`);
+  
+      await Share.open({
+        title: 'Eksport CSV',
+        url: `file://${filePath}`,
+        type: 'text/csv',
+        filename: fileName,
+      });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+  
+      if (message.includes('User did not share')) {
+        addLog('CSV export cancelled');
+        return;
+      }
+  
+      addLog(`CSV export error: ${message}`);
+      Alert.alert('Błąd eksportu CSV', message);
+    }
+  }
+
   async function disconnect() {
     const device = deviceRef.current;
 
@@ -418,6 +459,7 @@ export default function App() {
         <Button title="Połącz BLE" onPress={scanAndConnect} />
         <Button title="PING" onPress={() => sendCommand('PING')} />
         <Button title="START 5s" onPress={() => startMeasurement(5000)} />
+        <Button title="Eksportuj CSV" onPress={exportCsv} disabled={!csvReady} />
         <Button title="Rozłącz" onPress={disconnect} />
       </View>
 
