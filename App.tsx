@@ -302,7 +302,9 @@ export default function App() {
       const expectedSamples = readU32LE(bytes, 1);
       const samplePeriodMs = readU16LE(bytes, 5);
   
-      csvLinesRef.current = ['sample_id,t_ms,ax_raw,ay_raw,az_raw'];
+      csvLinesRef.current = [
+        'sample_id,t_ms,ax_raw,ay_raw,az_raw,ax_mg,ay_mg,az_mg',
+      ];
       expectedSamplesRef.current = expectedSamples;
       receivingBinaryRef.current = true;
   
@@ -335,7 +337,22 @@ export default function App() {
       const ay = readI16LE(bytes, 11);
       const az = readI16LE(bytes, 13);
   
-      csvLinesRef.current.push(`${sampleId},${tMs},${ax},${ay},${az}`);
+      const axMg = ax * 1000.0 / 1024.0;
+      const ayMg = ay * 1000.0 / 1024.0;
+      const azMg = az * 1000.0 / 1024.0;
+      
+      csvLinesRef.current.push(
+        [
+          sampleId,
+          tMs,
+          ax,
+          ay,
+          az,
+          axMg.toFixed(3),
+          ayMg.toFixed(3),
+          azMg.toFixed(3),
+        ].join(','),
+      );
   
       const samples = csvLinesRef.current.length - 1;
 
