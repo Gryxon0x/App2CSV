@@ -140,7 +140,6 @@ export default function App() {
   const sendTriggeredRef = useRef(false);
 
   const [status, setStatus] = useState('IDLE');
-  const [deviceName, setDeviceName] = useState<string>('-');
   const [log, setLog] = useState<string[]>([]);
 
   const [csvReady, setCsvReady] = useState(false);
@@ -453,7 +452,7 @@ export default function App() {
     textBuffersRef.current = {};
   
     setStatus('DISCONNECTED');
-    setDeviceName('-');
+    setConnectedCount(0);
   }
 
   function handleBinaryPacket(bytes: Uint8Array): boolean {
