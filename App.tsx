@@ -157,7 +157,7 @@ export default function App() {
       return;
     }
 
-    addLog(`RX: ${line}`);
+    addLog(`RX ${getDeviceName(deviceId)}: ${line}`);
 
     if (line === 'START_ACCEPTED') {
       setStatus('START_ACCEPTED');
@@ -205,7 +205,7 @@ export default function App() {
     textBuffersRef.current[deviceId] = (textBuffersRef.current[deviceId] ?? '') + chunk;
 
     const parts = textBuffersRef.current[deviceId].split(/\r?\n/);
-    textBuffersRef.current = parts.pop() ?? '';
+    textBuffersRef.current[deviceId] = parts.pop() ?? '';
 
     for (const rawLine of parts) {
       handleLine(deviceId, rawLine.trim());
@@ -336,17 +336,23 @@ export default function App() {
       return;
     }
   
-    await device.writeCharacteristicWithResponseForService(
-      BMA400_SERVICE_UUID,
-      BMA400_COMMAND_UUID,
-      textToBase64(command),
-    );
+    try {
+      await device.writeCharacteristicWithResponseForService(
+        BMA400_SERVICE_UUID,
+        BMA400_COMMAND_UUID,
+        textToBase64(command),
+      );
   
-    addLog(`TX ${getDeviceName(deviceId)}: ${command}`);
+      addLog(`TX ${getDeviceName(deviceId)}: ${command}`);
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      addLog(`Write error ${getDeviceName(deviceId)}: ${message}`);
+      setStatus('WRITE_ERROR');
+    }
   }
 
   async function sendCommandToAll(command: string) {
-    for (const id of [1, 2, 3]) {
+    for (const id of TARGET_DEVICE_IDS) {
       await sendCommandToDevice(id, command);
     }
   }
@@ -367,6 +373,7 @@ export default function App() {
     
   datasetsRef.current = {};
   textBuffersRef.current = {};
+  sendTriggeredRef.current = false;
 
   setCsvReady(false);
   setCsvText('');
@@ -382,12 +389,12 @@ export default function App() {
   
     const lines = [
       header,
-      ...[1, 2, 3].flatMap(id => datasetsRef.current[id]?.lines ?? []),
+      ...TARGET_DEVICE_IDS.flatMap(id => datasetsRef.current[id]?.lines ?? []),
     ];
   
     const csv = lines.join('\n') + '\n';
   
-    const totalSamples = [1, 2, 3].reduce(
+    const totalSamples = TARGET_DEVICE_IDS.reduce(
       (sum, id) => sum + (datasetsRef.current[id]?.receivedSamples ?? 0),
       0,
     );
@@ -450,6 +457,10 @@ export default function App() {
   
     connectedDevicesRef.current = {};
     textBuffersRef.current = {};
+
+    datasetsRef.current = {};
+    sendTriggeredRef.current = false;
+    connectingDevicesRef.current = {};
   
     setStatus('DISCONNECTED');
     setConnectedCount(0);
@@ -490,7 +501,7 @@ export default function App() {
   
       setStatus('RECEIVING_BINARY');
   
-      addLog(`BIN BEGIN: samples=${expectedSamples}, period=${samplePeriodMs} ms`);
+      addLog(`BIN BEGIN: ${deviceName}: samples=${expectedSamples}, period=${samplePeriodMs} ms`);
       return true;
     }
   
@@ -586,7 +597,7 @@ export default function App() {
         `BIN END ${dataset.deviceName}: endCount=${endCount}, received=${dataset.receivedSamples}`,
       );
     
-      const allDone = [1, 2, 3].every(id => datasetsRef.current[id]?.done);
+      const allDone = TARGET_DEVICE_IDS.every(id => datasetsRef.current[id]?.done);
     
       if (allDone) {
         buildCombinedCsv();
