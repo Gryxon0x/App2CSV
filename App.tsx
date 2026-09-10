@@ -23,6 +23,8 @@ import {Buffer} from 'buffer';
 import RNFS from 'react-native-fs';
 import Share from 'react-native-share';
 
+import performance from 'react-native-performance';
+
 const BMA400_SERVICE_UUID = '12345678-1234-5678-1234-56789abcdef0';
 const BMA400_COMMAND_UUID = '12345678-1234-5678-1234-56789abcdef1';
 const BMA400_DATA_UUID = '12345678-1234-5678-1234-56789abcdef2';
@@ -184,16 +186,94 @@ export default function App() {
 
   const connectingDevicesRef = useRef<Record<number, boolean>>({});
 
+  const syncSeqRef = useRef(1);
+  const pendingSyncRef = useRef<Record<number, PendingSyncRequest | undefined>>({});
+  const syncAttemptsRef = useRef<Record<number, SyncAttempt[]>>({});
+  const clockOffsetsRef = useRef<Record<number, number>>({});
+
+  const [syncedCount, setSyncedCount] = useState(0);
+
+  function handleSyncReply(
+    connectionDeviceId: number,
+    line: string,
+    phoneRxMs: number,
+  ): boolean {
+    if (!line.startsWith('SYNC_REPLY,')) {
+      return false;
+    }
+  
+    const parts = line.split(',');
+  
+    if (parts.length < 4) {
+      addLog(`Invalid SYNC_REPLY: ${line}`);
+      return true;
+    }
+  
+    const seq = Number(parts[1]);
+    const replyDeviceId = Number(parts[2]);
+    const deviceUptimeMs = Number(parts[3]);
+  
+    if (
+      !Number.isFinite(seq) ||
+      !Number.isFinite(replyDeviceId) ||
+      !Number.isFinite(deviceUptimeMs)
+    ) {
+      addLog(`Invalid SYNC_REPLY numbers: ${line}`);
+      return true;
+    }
+  
+    if (replyDeviceId !== connectionDeviceId) {
+      addLog(
+        `SYNC_REPLY device mismatch: connection=${connectionDeviceId}, reply=${replyDeviceId}`,
+      );
+    }
+  
+    const pending = pendingSyncRef.current[replyDeviceId];
+  
+    if (!pending || pending.seq !== seq) {
+      addLog(`Ignoring stale SYNC_REPLY: ${line}`);
+      return true;
+    }
+  
+    clearTimeout(pending.timeoutId);
+    pendingSyncRef.current[replyDeviceId] = undefined;
+  
+    const phoneTxMs = pending.phoneTxMs;
+    const rttMs = phoneRxMs - phoneTxMs;
+    const phoneMidMs = (phoneTxMs + phoneRxMs) / 2.0;
+    const offsetMs = phoneMidMs - deviceUptimeMs;
+  
+    const attempt: SyncAttempt = {
+      sessionId: currentSessionIdRef.current,
+      deviceId: replyDeviceId,
+      deviceName: getDeviceName(replyDeviceId),
+      seq,
+      phoneTxMs,
+      phoneRxMs,
+      phoneMidMs,
+      deviceUptimeMs,
+      rttMs,
+      offsetMs,
+      selected: false,
+    };
+  
+    pending.resolve(attempt);
+    return true;
+  }
+
   function addLog(message: string) {
     setLog(prev => [`${new Date().toLocaleTimeString()}  ${message}`, ...prev]);
   }
 
-  function handleLine(deviceId: number, line: string) {
+  function handleLine(deviceId: number, line: string, phoneRxMs: number = phoneMonoMs()) {
     if (!line) {
       return;
     }
 
     addLog(`RX ${getDeviceName(deviceId)}: ${line}`);
+    if (handleSyncReply(deviceId, line, phoneRxMs)) {
+      return;
+    }
 
     if (line === 'START_ACCEPTED') {
       setStatus('START_ACCEPTED');
@@ -215,6 +295,8 @@ export default function App() {
         expectedSamples: previous?.expectedSamples ?? 0,
         receivedSamples: previous?.receivedSamples ?? 0,
         samplePeriodMs: previous?.samplePeriodMs ?? 0,
+        collectStartUptimeMs: previous?.collectStartUptimeMs ?? 0,
+        clockOffsetMs: previous?.clockOffsetMs ?? clockOffsetsRef.current[deviceId] ?? 0,
         readyToSend: true,
         receivingBinary: previous?.receivingBinary ?? false,
         done: previous?.done ?? false,
@@ -237,7 +319,7 @@ export default function App() {
   }
 }
 
-  function handleReceivedTextChunk(deviceId: number, chunk: string) {
+  function handleReceivedTextChunk(deviceId: number, chunk: string, phoneRxMs:number) {
     textBuffersRef.current[deviceId] = (textBuffersRef.current[deviceId] ?? '') + chunk;
 
     const parts = textBuffersRef.current[deviceId].split(/\r?\n/);
@@ -249,6 +331,7 @@ export default function App() {
   }
 
   function handleBleNotification(deviceId: number, bytes: Uint8Array) {
+    const rxMonoMs = phoneMonoMs();
     if (bytes.length === 0) {
       return;
     }
@@ -262,8 +345,99 @@ export default function App() {
     const text = bytesToText(bytes);
   
     if (text.length > 0) {
-      handleReceivedTextChunk(deviceId, text);
+      handleReceivedTextChunk(deviceId, text, rxMonoMs);
     }
+  }
+
+  async function syncOneAttempt(deviceId: number): Promise<SyncAttempt> {
+    const seq = syncSeqRef.current++;
+    const phoneTxMs = phoneMonoMs();
+  
+    return new Promise<SyncAttempt>((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        const pending = pendingSyncRef.current[deviceId];
+  
+        if (pending?.seq === seq) {
+          pendingSyncRef.current[deviceId] = undefined;
+        }
+  
+        reject(new Error(`SYNC timeout ${getDeviceName(deviceId)} seq=${seq}`));
+      }, SYNC_TIMEOUT_MS);
+  
+      pendingSyncRef.current[deviceId] = {
+        seq,
+        phoneTxMs,
+        timeoutId,
+        resolve,
+        reject,
+      };
+  
+      sendCommandToDevice(deviceId, `SYNC,${seq}`);
+    });
+  }
+  
+  async function syncDeviceClock(deviceId: number) {
+    const attempts: SyncAttempt[] = [];
+  
+    addLog(`SYNC start ${getDeviceName(deviceId)}`);
+  
+    for (let i = 0; i < SYNC_ATTEMPTS_PER_DEVICE; i++) {
+      try {
+        const attempt = await syncOneAttempt(deviceId);
+        attempts.push(attempt);
+  
+        if (i === 0 || attempt.rttMs < 20) {
+          addLog(
+            `SYNC ${getDeviceName(deviceId)} seq=${attempt.seq}, rtt=${attempt.rttMs.toFixed(
+              3,
+            )} ms, offset=${attempt.offsetMs.toFixed(3)} ms`,
+          );
+        }
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e);
+        addLog(message);
+      }
+  
+      await delay(SYNC_DELAY_BETWEEN_ATTEMPTS_MS);
+    }
+  
+    if (attempts.length === 0) {
+      throw new Error(`No valid SYNC replies from ${getDeviceName(deviceId)}`);
+    }
+  
+    let best = attempts[0];
+  
+    for (const attempt of attempts) {
+      if (attempt.rttMs < best.rttMs) {
+        best = attempt;
+      }
+    }
+  
+    best.selected = true;
+    syncAttemptsRef.current[deviceId] = attempts;
+    clockOffsetsRef.current[deviceId] = best.offsetMs;
+  
+    addLog(
+      `SYNC selected ${getDeviceName(deviceId)}: rtt=${best.rttMs.toFixed(
+        3,
+      )} ms, offset=${best.offsetMs.toFixed(3)} ms`,
+    );
+  }
+  
+  async function syncAllDeviceClocks() {
+    setStatus('SYNCING');
+    setSyncedCount(0);
+  
+    syncAttemptsRef.current = {};
+    clockOffsetsRef.current = {};
+  
+    for (const id of TARGET_DEVICE_IDS) {
+      await syncDeviceClock(id);
+      setSyncedCount(Object.keys(clockOffsetsRef.current).length);
+    }
+  
+    setStatus('SYNC_READY');
+    addLog('SYNC ready for all devices');
   }
 
   async function connectAndSetupNotify(deviceId: number, device: Device) {
@@ -402,26 +576,40 @@ export default function App() {
       Alert.alert('Nie wszystkie urządzenia są połączone');
       return;
     }
-
+  
     currentSessionIdRef.current = new Date()
-  .toISOString()
-  .replace(/[:.]/g, '-');
-    
-  datasetsRef.current = {};
-  textBuffersRef.current = {};
-  sendTriggeredRef.current = false;
-
-  setCsvReady(false);
-  setCsvText('');
-  setSampleCount(0);
-  setStatus('STARTING');
-
-  await sendCommandToAll(`START,${durationMs}`);
+      .toISOString()
+      .replace(/[:.]/g, '-');
+  
+    datasetsRef.current = {};
+    textBuffersRef.current = {};
+    pendingSyncRef.current = {};
+    syncAttemptsRef.current = {};
+    clockOffsetsRef.current = {};
+    sendTriggeredRef.current = false;
+  
+    setCsvReady(false);
+    setCsvText('');
+    setSampleCount(0);
+    setSyncedCount(0);
+  
+    try {
+      await syncAllDeviceClocks();
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      addLog(`SYNC failed: ${message}`);
+      setStatus('SYNC_ERROR');
+      Alert.alert('Błąd synchronizacji', message);
+      return;
+    }
+  
+    setStatus('STARTING');
+    await sendCommandToAll(`START,${durationMs}`);
   }
 
   function buildCombinedCsv() {
     const header =
-      'session_id,device_id,device_name,sample_id,t_ms,ax_raw,ay_raw,az_raw,ax_mg,ay_mg,az_mg';
+      'session_id,device_id,device_name,sample_id,t_ms,device_uptime_ms,phone_time_est_ms,ax_raw,ay_raw,az_raw,ax_mg,ay_mg,az_mg';
   
     const lines = [
       header,
@@ -454,18 +642,22 @@ export default function App() {
         .toISOString()
         .replace(/[:.]/g, '-');
   
-      const fileName = `bma400_${timestamp}.csv`;
-      const filePath = `${RNFS.CachesDirectoryPath}/${fileName}`;
+      const samplesFileName = `bma400_samples_${timestamp}.csv`;
+      const syncFileName = `bma400_sync_${timestamp}.csv`;
+        
+      const samplesFilePath = `${RNFS.CachesDirectoryPath}/${samplesFileName}`;
+      const syncFilePath = `${RNFS.CachesDirectoryPath}/${syncFileName}`;
   
-      await RNFS.writeFile(filePath, csvText, 'utf8');
+      await RNFS.writeFile(samplesFilePath, csvText, 'utf8');
+      await RNFS.writeFile(syncFilePath, buildSyncCsv(), 'utf8');
   
-      addLog(`CSV saved to cache: ${fileName}`);
+      addLog(`CSV saved: ${samplesFileName}`);
+      addLog(`SYNC CSV saved: ${syncFileName}`);
   
       await Share.open({
         title: 'Eksport CSV',
-        url: `file://${filePath}`,
+        urls: [`file://${samplesFilePath}`, `file://${syncFilePath}`],
         type: 'text/csv',
-        filename: fileName,
       });
     } catch (e) {
       const message = e instanceof Error ? e.message : String(e);
@@ -510,7 +702,7 @@ export default function App() {
     const type = bytes[0];
   
     if (type === 0x10) {
-      if (bytes.length !== 8) {
+      if (bytes.length !== 12) {
         addLog(`Invalid BEGIN packet length: ${bytes.length}`);
         setStatus('BINARY_BEGIN_ERROR');
         return true;
@@ -519,9 +711,16 @@ export default function App() {
       const deviceId = bytes[1];
       const expectedSamples = readU32LE(bytes, 2);
       const samplePeriodMs = readU16LE(bytes, 6);
+      const collectStartUptimeMs = readU32LE(bytes, 8);
       const deviceName = getDeviceName(deviceId);
-  
       const previous = datasetsRef.current[deviceId];
+      const clockOffsetMs = clockOffsetsRef.current[deviceId];
+   
+      if (clockOffsetMs === undefined) {
+        addLog(`Missing clock offset for ${deviceName}`);
+        setStatus('SYNC_MISSING');
+        return true;
+      }
 
       datasetsRef.current[deviceId] = {
         deviceId,
@@ -529,6 +728,8 @@ export default function App() {
         expectedSamples,
         receivedSamples: 0,
         samplePeriodMs,
+        collectStartUptimeMs,
+        clockOffsetMs,
         readyToSend: previous?.readyToSend ?? false,
         receivingBinary: true,
         done: false,
@@ -537,7 +738,7 @@ export default function App() {
   
       setStatus('RECEIVING_BINARY');
   
-      addLog(`BIN BEGIN: ${deviceName}: samples=${expectedSamples}, period=${samplePeriodMs} ms`);
+      addLog(`BIN BEGIN: ${deviceName}: samples=${expectedSamples}, period=${samplePeriodMs} ms, collectStart=${collectStartUptimeMs}`);
       return true;
     }
   
@@ -567,6 +768,9 @@ export default function App() {
       const axMg = ax * 1000.0 / 1024.0;
       const ayMg = ay * 1000.0 / 1024.0;
       const azMg = az * 1000.0 / 1024.0;
+
+      const deviceUptimeMs = dataset.collectStartUptimeMs + tMs;
+      const phoneTimeEstMs = deviceUptimeMs + dataset.clockOffsetMs;
       
       dataset.lines.push(
         [
@@ -575,6 +779,8 @@ export default function App() {
           dataset.deviceName,
           sampleId,
           tMs,
+          deviceUptimeMs,
+          phoneTimeEstMs.toFixed(3),
           ax,
           ay,
           az,
@@ -645,12 +851,41 @@ export default function App() {
     return false;
   }
 
+  function buildSyncCsv(): string {
+    const header =
+      'session_id,device_id,device_name,seq,phone_tx_ms,phone_rx_ms,phone_mid_ms,device_uptime_ms,rtt_ms,offset_ms,selected';
+  
+    const lines = [
+      header,
+      ...TARGET_DEVICE_IDS.flatMap(id =>
+        (syncAttemptsRef.current[id] ?? []).map(attempt =>
+          [
+            attempt.sessionId,
+            attempt.deviceId,
+            attempt.deviceName,
+            attempt.seq,
+            attempt.phoneTxMs.toFixed(3),
+            attempt.phoneRxMs.toFixed(3),
+            attempt.phoneMidMs.toFixed(3),
+            attempt.deviceUptimeMs,
+            attempt.rttMs.toFixed(3),
+            attempt.offsetMs.toFixed(3),
+            attempt.selected ? 'true' : 'false',
+          ].join(','),
+        ),
+      ),
+    ];
+  
+    return lines.join('\n') + '\n';
+  }
+
   return (
     <SafeAreaView style={styles.root}>
       <View style={styles.header}>
         <Text style={styles.title}>BMA400 Logger</Text>
         <Text>Status: {status}</Text>
         <Text>Connected: {connectedCount}/3</Text>
+        <Text>Synced: {syncedCount}/3</Text>
         <Text>Samples: {sampleCount}</Text>
         <Text>CSV ready: {csvReady ? 'YES' : 'NO'}</Text>
         <Text>CSV chars: {csvText.length}</Text>
