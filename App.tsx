@@ -39,6 +39,8 @@ type DeviceDataset = {
   expectedSamples: number;
   receivedSamples: number;
   samplePeriodMs: number;
+  collectStartUptimeMs: number;
+  clockOffsetMs: number;
   readyToSend: boolean;
   receivingBinary: boolean;
   done: boolean;
@@ -46,6 +48,32 @@ type DeviceDataset = {
 };
 
 const TARGET_DEVICE_IDS = [1, 2, 3] as const;
+
+const SYNC_ATTEMPTS_PER_DEVICE = 20;
+const SYNC_TIMEOUT_MS = 1000;
+const SYNC_DELAY_BETWEEN_ATTEMPTS_MS = 40;
+
+type SyncAttempt = {
+  sessionId: string;
+  deviceId: number;
+  deviceName: string;
+  seq: number;
+  phoneTxMs: number;
+  phoneRxMs: number;
+  phoneMidMs: number;
+  deviceUptimeMs: number;
+  rttMs: number;
+  offsetMs: number;
+  selected: boolean;
+};
+
+type PendingSyncRequest = {
+  seq: number;
+  phoneTxMs: number;
+  timeoutId: ReturnType<typeof setTimeout>;
+  resolve: (attempt: SyncAttempt) => void;
+  reject: (error: Error) => void;
+};
 
 function getDeviceIdFromName(name?: string | null): number | null {
   if (name === 'BMA400_WRIST') {
