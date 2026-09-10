@@ -75,6 +75,14 @@ type PendingSyncRequest = {
   reject: (error: Error) => void;
 };
 
+function delay(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function phoneMonoMs(): number {
+  return performance.now();
+}
+
 function getDeviceIdFromName(name?: string | null): number | null {
   if (name === 'BMA400_WRIST') {
     return 1;
