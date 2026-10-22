@@ -35,6 +35,8 @@ const DEVICE_NAMES: Record<number, string> = {
   3: 'BMA400_ANKLE_R',
 };
 
+const MAX_LOG_LINES = 20;
+
 type DeviceDataset = {
   deviceId: number;
   deviceName: string;
@@ -262,7 +264,8 @@ export default function App() {
   }
 
   function addLog(message: string) {
-    setLog(prev => [`${new Date().toLocaleTimeString()}  ${message}`, ...prev]);
+    const line = `${new Date().toLocaleTimeString()} ${message}`;
+    setLog(prev => [line, ...prev].slice(0, MAX_LOG_LINES));
   }
 
   function handleLine(deviceId: number, line: string, phoneRxMs: number = phoneMonoMs()) {
@@ -894,7 +897,7 @@ export default function App() {
       <View style={styles.buttons}>
         <Button title="Połącz BLE" onPress={scanAndConnect} />
         <Button title="PING all" onPress={() => sendCommandToAll('PING')} />
-        <Button title="START 5s" onPress={() => startMeasurement(5000)} />
+        <Button title="START 10s" onPress={() => startMeasurement(10000)} />
         <Button title="Eksportuj CSV" onPress={exportCsv} disabled={!csvReady} />
         <Button title="Rozłącz" onPress={disconnect} />
       </View>
