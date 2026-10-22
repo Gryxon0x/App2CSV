@@ -33,6 +33,8 @@ const DEVICE_NAMES: Record<number, string> = {
   1: 'BMA400_WRIST',
   2: 'BMA400_ANKLE_L',
   3: 'BMA400_ANKLE_R',
+  4: 'BMA400_THIGH_L',
+  5: 'BMA400_CHEST'
 };
 
 const MAX_LOG_LINES = 20;
@@ -51,7 +53,7 @@ type DeviceDataset = {
   lines: string[];
 };
 
-const TARGET_DEVICE_IDS = [1, 2, 3] as const;
+const TARGET_DEVICE_IDS = [1, 2, 3, 4, 5] as const;
 
 const SYNC_ATTEMPTS_PER_DEVICE = 20;
 const SYNC_TIMEOUT_MS = 1000;
@@ -98,6 +100,14 @@ function getDeviceIdFromName(name?: string | null): number | null {
 
   if (name === 'BMA400_ANKLE_R') {
     return 3;
+  }
+
+  if (name === 'BMA400_THIGH_L') {
+    return 4;
+  }
+
+  if (name === 'BMA400_CHEST') {
+    return 5;
   }
 
   return null;
@@ -887,8 +897,8 @@ export default function App() {
       <View style={styles.header}>
         <Text style={styles.title}>BMA400 Logger</Text>
         <Text>Status: {status}</Text>
-        <Text>Connected: {connectedCount}/3</Text>
-        <Text>Synced: {syncedCount}/3</Text>
+        <Text>Connected: {connectedCount}/{TARGET_DEVICE_IDS.length}</Text>
+        <Text>Synced: {syncedCount}/{TARGET_DEVICE_IDS.length}</Text>
         <Text>Samples: {sampleCount}</Text>
         <Text>CSV ready: {csvReady ? 'YES' : 'NO'}</Text>
         <Text>CSV chars: {csvText.length}</Text>
@@ -897,7 +907,7 @@ export default function App() {
       <View style={styles.buttons}>
         <Button title="Połącz BLE" onPress={scanAndConnect} />
         <Button title="PING all" onPress={() => sendCommandToAll('PING')} />
-        <Button title="START 10s" onPress={() => startMeasurement(10000)} />
+        <Button title="START 60s" onPress={() => startMeasurement(60000)} />
         <Button title="Eksportuj CSV" onPress={exportCsv} disabled={!csvReady} />
         <Button title="Rozłącz" onPress={disconnect} />
       </View>
