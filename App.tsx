@@ -866,7 +866,7 @@ export default function App() {
 
   function buildSyncCsv(): string {
     const header =
-      'session_id,device_id,device_name,seq,phone_tx_ms,phone_rx_ms,phone_mid_ms,device_uptime_ms,rtt_ms,offset_ms,selected';
+      'session_id,device_id,device_name,seq,phone_tx_ms,phone_rx_ms,phone_mid_ms,device_uptime_ms,rtt_ms,offset_ms,selected'; 
   
     const lines = [
       header,
