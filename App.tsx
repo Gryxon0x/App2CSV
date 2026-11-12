@@ -11,6 +11,7 @@ import {
   Button,
   PermissionsAndroid,
   Platform,
+  Pressable,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -205,6 +206,14 @@ export default function App() {
 
   const [syncedCount, setSyncedCount] = useState(0);
 
+  const [measurementWindowOpen, setMeasurementWindowOpen] = useState(false);
+  const [stepCount, setStepCount] = useState(0);
+
+  const measurementWindowOpenRef = useRef(false);
+  const collectingDevicesRef = useRef<Record<number, boolean>>({});
+  const stepLinesRef = useRef<string[]>([]);
+  const stepCountRef = useRef(0);
+
   function handleSyncReply(
     connectionDeviceId: number,
     line: string,
@@ -291,8 +300,31 @@ export default function App() {
     if (line === 'START_ACCEPTED') {
       setStatus('START_ACCEPTED');
     } else if (line === 'COLLECTING') {
-      setStatus('COLLECTING');
+      collectingDevicesRef.current[deviceId] = true;
+
+      const collectingCount = TARGET_DEVICE_IDS.filter(id => collectingDevicesRef.current[id],).length;
+
+      const allCollecting = TARGET_DEVICE_IDS.every(id => collectingDevicesRef.current[id],);
+
+      if (allCollecting) {
+        setMeasurementWindow(true);
+        setStatus('MEASURING');
+        addLog('Measurement window OPEN');
+      } else {
+        setStatus(
+          `COLLECTING_${collectingCount}/${TARGET_DEVICE_IDS.length}`,
+        );
+      }
     } else if (line === 'COLLECTION_DONE') {
+      collectingDevicesRef.current[deviceId] = false;
+
+      if (measurementWindowOpenRef.current) {
+        setMeasurementWindow(false);
+        addLog(
+          `Measurement window CLOSED by ${getDeviceName(deviceId)}`,
+        );
+      }
+
       setStatus('COLLECTION_DONE');
     } else if (line.startsWith('ERROR,')) {
       setStatus(line);
@@ -360,6 +392,44 @@ export default function App() {
     if (text.length > 0) {
       handleReceivedTextChunk(deviceId, text, rxMonoMs);
     }
+  }
+
+  function setMeasurementWindow(open: boolean) {
+    measurementWindowOpenRef.current = open;
+    setMeasurementWindowOpen(open);
+  }
+
+  function recordStep() {
+    if (!measurementWindowOpenRef.current) {
+      return;
+    }
+
+    const phoneTimeMs = phoneMonoMs();
+
+    stepCountRef.current += 1;
+    const stepId = stepCountRef.current;
+
+    stepLinesRef.current.push(
+      [
+        'STEP',
+        currentSessionIdRef.current,
+        '', // device_id
+        '', // device_name
+        '', // sample_id
+        '', // t_ms
+        '', // device_uptime_ms
+        phoneTimeMs.toFixed(3),
+        stepId,
+        '', // ax_raw
+        '', // ay_raw
+        '', // az_raw
+        '', // ax_mg
+        '', // ay_mg
+        '', // az_mg
+      ].join(','),
+    );
+
+    setStepCount(stepId);
   }
 
   async function syncOneAttempt(deviceId: number): Promise<SyncAttempt> {
@@ -596,11 +666,18 @@ export default function App() {
   
     datasetsRef.current = {};
     textBuffersRef.current = {};
+    collectingDevicesRef.current = {};
+    stepLinesRef.current = [];
+
     pendingSyncRef.current = {};
     syncAttemptsRef.current = {};
     clockOffsetsRef.current = {};
     sendTriggeredRef.current = false;
-  
+
+    stepCountRef.current = 0;
+
+    setStepCount(0);
+    setMeasurementWindow(false);
     setCsvReady(false);
     setCsvText('');
     setSampleCount(0);
@@ -622,11 +699,24 @@ export default function App() {
 
   function buildCombinedCsv() {
     const header =
-      'session_id,device_id,device_name,sample_id,t_ms,device_uptime_ms,phone_time_est_ms,ax_raw,ay_raw,az_raw,ax_mg,ay_mg,az_mg';
+      'row_type,session_id,device_id,device_name,sample_id,t_ms,device_uptime_ms,phone_time_est_ms,step_id,ax_raw,ay_raw,az_raw,ax_mg,ay_mg,az_mg';
   
-    const lines = [
+    const dataLines = [
       header,
       ...TARGET_DEVICE_IDS.flatMap(id => datasetsRef.current[id]?.lines ?? []),
+      ...stepLinesRef.current,
+    ];
+
+    dataLines.sort((a, b) => {
+      const timeA = Number(a.split(',')[7]);
+      const timeB = Number(b.split(',')[7]);
+
+      return timeA - timeB;
+    });
+
+    const lines = [
+      header,
+      ...dataLines,
     ];
   
     const csv = lines.join('\n') + '\n';
@@ -702,6 +792,9 @@ export default function App() {
     datasetsRef.current = {};
     sendTriggeredRef.current = false;
     connectingDevicesRef.current = {};
+
+    collectingDevicesRef.current = {};
+    setMeasurementWindow(false);
   
     setStatus('DISCONNECTED');
     setConnectedCount(0);
@@ -787,6 +880,7 @@ export default function App() {
       
       dataset.lines.push(
         [
+          'SAMPLE',
           currentSessionIdRef.current,
           deviceId,
           dataset.deviceName,
@@ -794,6 +888,7 @@ export default function App() {
           tMs,
           deviceUptimeMs,
           phoneTimeEstMs.toFixed(3),
+          '', // step_id
           ax,
           ay,
           az,
@@ -904,6 +999,19 @@ export default function App() {
         <Text>CSV chars: {csvText.length}</Text>
       </View>
 
+      <Pressable
+        onPressIn={recordStep}
+        disabled={!measurementWindowOpen}
+        style={({pressed}) => [
+          styles.stepButton,
+          !measurementWindowOpen && styles.stepButtonDisabled,
+          pressed && measurementWindowOpen && styles.stepButtonPressed,
+        ]}>
+          <Text style={styles.stepButtonText}>KROK</Text>
+
+          <Text style={styles.stepCounter}>Oznaczono: {stepCount}</Text>
+        </Pressable>
+
       <View style={styles.buttons}>
         <Button title="Połącz BLE" onPress={scanAndConnect} />
         <Button title="PING all" onPress={() => sendCommandToAll('PING')} />
@@ -950,4 +1058,26 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginBottom: 4,
   },
+  stepButton: {
+    minHeight: 160,
+    borderWidth: 2,
+    borderRadius: 16,
+    marginBottom: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stepButtonDisabled: {
+    opacity: 0.3,
+  },
+  stepButtonPressed: {
+    opacity: 0.6,
+  },
+  stepButtonText: {
+    fontSize: 36,
+    fontWeight: '800',
+  },
+  stepCounter: {
+    fontSize: 18,
+    marginTop: 8,
+  }
 });
